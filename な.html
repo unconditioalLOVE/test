@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>THE DISTANT</title>
+<style>
+:root { color-scheme: dark; --ground: #0a1017; }
+html, body { height: 100%; margin: 0; overflow: hidden; background: var(--ground); }
+canvas#c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; background: var(--ground); }
+</style>
+<canvas id="c" aria-label="霧の平原と海の遠景"></canvas>
+<script>
+(() => {
+'use strict';
+
+/* ---------- shaders ---------- */
+const VS = 'attribute vec2 a;varying vec2 vUv;void main(){vUv=a*.5+.5;gl_Position=vec4(a,0.,1.);}';
+const HDR = '#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\nvarying vec2 vUv;\n' +
+'float h21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}\n' +
+'float vn(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(h21(i),h21(i+vec2(1.,0.)),f.x),mix(h21(i+vec2(0.,1.)),h21(i+vec2(1.,1.)),f.x),f.y);}\n' +
+'float fbm(vec2 p){float a=.5,s=0.;for(int i=0;i<4;i++){s+=a*vn(p);p=p*2.03+vec2(1.7,9.2);a*=.5;}return s;}\n';
+
+const FS_SCENE = HDR + `
+uniform vec2 uRes; uniform float uT,uZoom; uniform vec2 uWin;
+uniform float uDusk,uFog,uCloud,uRain,uFrost,uGlint; uniform vec2 uGlow;
+uniform sampler2D uFig; uniform vec2 uFigPx;
+const float H=.62; const float S=.50;
+float fogAt(vec2 uv,float asp,float t){
+  float base=uFog*(.22+.78*smoothstep(0.,.55,uv.y));
+  float drift=fbm(vec2(uv.x*asp*2.2-t*.006,uv.y*7.+t*.002));
+  float low=smoothstep(.12,.62,fbm(vec2(uv.x*asp*1.1-t*.004+3.,uv.y*3.+t*.0015)));
+  float f=base*(.5+.75*drift)+uFog*.38*low*smoothstep(.62,.28,uv.y);
+  f*=1.-.72*smoothstep(H,H+.25,uv.y);
+  return clamp(f,0.,.95);
+}
+void main(){
+  float asp=uRes.x/uRes.y; float t=uT;
+  vec2 uv=uWin+vUv/uZoom;
+  vec3 skyTop=mix(vec3(.040,.062,.105),vec3(.135,.175,.265),uDusk);
+  vec3 skyHor=mix(vec3(.18,.29,.35),vec3(.575,.565,.625),uDusk);
+  float grey=clamp(uCloud*.35+uRain*.35,0.,1.);
+  skyTop=mix(skyTop,vec3(dot(skyTop,vec3(.33)))+vec3(.01,.015,.025),grey*.5);
+  /* sky */
+  float sy=clamp((uv.y-H)/(1.-H),0.,1.);
+  vec3 sky=mix(skyHor,skyTop,pow(sy,.55));
+  float glow=exp(-(pow((uv.x-.64)*asp*1.6,2.)+pow((uv.y-.76)*2.6,2.)));
+  sky+=vec3(.11,.14,.18)*glow*(1.-uDusk*.6)*(1.-uCloud*.55);
+  sky+=vec3(.14,.11,.12)*uDusk*exp(-(pow((uv.x-.36)*asp*1.2,2.)+pow((uv.y-H)*7.,2.)));
+  float cn=fbm(vec2(uv.x*asp*1.2+t*.004,uv.y*3.2-t*.0012));
+  float cov=mix(.62,.28,uCloud);
+  float cl=smoothstep(cov,cov+.3,cn);
+  vec3 cloudCol=mix(skyTop*1.5,skyHor*.82,.55);
+  sky=mix(sky,cloudCol,cl*(.22+.6*uCloud)*smoothstep(H,H+.08,uv.y));
+  /* sea */
+  float sd=clamp((uv.y-S)/(H-S),0.,1.);
+  vec3 seaNear=mix(vec3(.07,.13,.17),vec3(.30,.34,.40),uDusk);
+  vec3 sea=mix(seaNear,skyHor*.96,pow(sd,.7));
+  float wv=fbm(vec2(uv.x*asp*5.+t*.02,uv.y*140.-t*.06+fbm(vec2(uv.x*asp*3.,t*.01))*2.));
+  sea+=(wv-.5)*.055*(1.-sd*.55)*(.7+uRain*.6);
+  float gl2=exp(-pow((uv.x-.64)*asp*4.5,2.));
+  sea+=gl2*(wv-.42)*(.10+uGlint*.16)*(1.-uCloud*.6)*(1.-uDusk*.7)*(1.-sd*.5);
+  sea+=uGlint*.018*(1.-sd);
+  float shore=exp(-pow((uv.y-S-.006-.003*sin(uv.x*asp*9.+t*.12))*150.,2.));
+  sea+=shore*.05*(.6+.4*vn(vec2(uv.x*asp*14.,t*.05)));
+  /* plain */
+  float z=1./(S+.04-min(uv.y,S));
+  vec2 wp=vec2((uv.x-.5)*asp*z,z);
+  float pn=fbm(wp*vec2(.9,1.4)+vec2(0.,t*.0005));
+  vec3 plain=vec3(.075,.100,.125)*(.82+.36*pn);
+  plain*=1.+uDusk*.45;
+  plain*=mix(.55,1.35,smoothstep(0.,S,uv.y));
+  float fr=uFrost*smoothstep(.0,.4,pn+.15);
+  float ice=smoothstep(.5,.85,fbm(wp*vec2(6.,8.)));
+  plain+=fr*ice*vec3(.09,.115,.14)*(.5+.5*(1.-uDusk*.5));
+  plain=mix(plain,plain*1.22+vec3(.012,.018,.026),uFrost*.5*pn);
+  float sp=step(.988,h21(floor(wp*vec2(70.,90.))));
+  plain+=uFrost*sp*vec3(.16,.2,.25)*(.6+.4*sin(t*.7+h21(floor(wp*60.))*40.));
+  /* compose */
+  vec3 col=plain;
+  col=mix(col,sea,smoothstep(S-.0015,S+.0015,uv.y));
+  col=mix(col,sky,smoothstep(H-.004,H+.007,uv.y));
+  col+=skyHor*.22*exp(-pow((uv.y-H)*26.,2.));
+  float f=fogAt(uv,asp,t);
+  vec3 fogCol=skyHor*.95+.03;
+  col=mix(col,fogCol,f);
+  vec2 gd=vec2((uv.x-uGlow.x)*asp*1.25,(uv.y-uGlow.y)*3.);
+  float gl3=exp(-dot(gd,gd)*1.6);
+  vec3 gcol=mix(vec3(.16,.37,.45),vec3(.55,.55,.60),uDusk);
+  col+=gcol*gl3*(.12+.88*uFog)*(.55+.45*vn(vec2(uv.x*asp*2.+t*.01,uv.y*4.)));
+  /* figures and birds (soft) */
+  float rr=1.+f*1.6;
+  vec2 d1=uFigPx*rr;
+  vec2 s=texture2D(uFig,uv).rg*.30
+    +(texture2D(uFig,uv+vec2(d1.x,0.)).rg+texture2D(uFig,uv-vec2(d1.x,0.)).rg+texture2D(uFig,uv+vec2(0.,d1.y)).rg+texture2D(uFig,uv-vec2(0.,d1.y)).rg)*.1
+    +(texture2D(uFig,uv+d1).rg+texture2D(uFig,uv-d1).rg+texture2D(uFig,uv+vec2(d1.x,-d1.y)).rg+texture2D(uFig,uv+vec2(-d1.x,d1.y)).rg)*.075;
+  vec3 figCol=mix(vec3(.018,.030,.052),vec3(.06,.07,.10),uDusk);
+  col=mix(col,figCol,s.r*(1.-f*.5)*.95);
+  col=mix(col,figCol,s.g*.5*(1.-f*.5));
+  /* rain veil */
+  float streak=pow(vn(vec2(uv.x*asp*160.,uv.y*5.+t*7.)),6.);
+  col+=uRain*streak*.018;
+  col=mix(col,fogCol,uRain*.08);
+  gl_FragColor=vec4(clamp(col,0.,1.),1.);
+}`;
+
+const FS_FINAL = HDR + `
+uniform sampler2D uScene,uCond,uDrops; uniform vec2 uRes; uniform float uT,uAmb;
+void main(){
+  float asp=uRes.x/uRes.y; vec2 uv=vUv;
+  vec4 d=texture2D(uDrops,uv);
+  vec2 off=(d.rg*2.-1.)*.045*d.a; off.x/=asp;
+  vec2 q=uv+off;
+  float c=texture2D(uCond,uv).r; c*=1.-d.a*.85;
+  float R=.0016+.012*c;
+  vec2 k1=vec2(R/asp,R), k2=k1*2.;
+  vec3 col=texture2D(uScene,q).rgb*.25;
+  for(int i=0;i<6;i++){
+    float a=float(i)*1.0472+.3;
+    vec2 dir=vec2(cos(a),sin(a));
+    col+=texture2D(uScene,q+dir*k1).rgb*(.5/6.);
+    col+=texture2D(uScene,q+dir*k2).rgb*(.25/6.);
+  }
+  float lum=dot(col,vec3(.3,.5,.2));
+  vec3 glass=mix(vec3(.30,.37,.45),vec3(.64,.67,.73),uAmb)*(.8+.5*lum);
+  col=mix(col,glass,c*.62);
+  col=mix(col,vec3(lum),c*.3);
+  col+=d.a*(.035+(d.g-.5)*.10);
+  col=mix(vec3(dot(col,vec3(.33))),col,.9);
+  col=col*.96+.012;
+  col+=(h21(uv*uRes+fract(uT)*91.)-.5)*.026;
+  col*=1.-.50*pow(length((uv-.5)*vec2(1.,.9))*1.25,2.4);
+  gl_FragColor=vec4(clamp(col,0.,1.),1.);
+}`;
+
+/* ---------- helpers ---------- */
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const approach = (v, t, dt, tau) => v + (t - v) * (1 - Math.exp(-dt / tau));
+const pickW = (list) => {
+  let s = 0; for (const o of list) s += o.w;
+  let r = Math.random() * s;
+  for (const o of list) { r -= o.w; if (r <= 0) return o; }
+  return list[list.length - 1];
+};
+let asp = 16 / 9;
+
+/* ---------- world: weather, light, sea ---------- */
+const W = { dusk: 0, fog: .55, cloud: .45, rain: 0, frost: 0, glint: 0 };
+const T = { dusk: 0, fog: .55, cloud: .45, rain: 0, frost: 0 };
+const TAU = { dusk: 70, fog: 60, cloud: 80, rain: 25, frost: 90 };
+let wTimer = rand(40, 100), evTimer = rand(120, 240), evLeft = 0, evName = '';
+let glTimer = rand(200, 500), glT = -1, glDur = 100, glAmp = 1;
+const hash = (location.hash || '').slice(1).split('-').filter(Boolean);
+const forced = hash.length > 0;
+
+function startEvent() {
+  const e = pickW([{ n: 'rain', w: 4 }, { n: 'dusk', w: 2.5 }, { n: 'frost', w: 1.5 }]);
+  evName = e.n;
+  if (e.n === 'frost' && (W.dusk > .2 || W.rain > .1)) evName = 'rain';
+  if (evName === 'rain') { T.rain = rand(.55, 1); T.fog = Math.max(T.fog, .6); T.cloud = Math.max(T.cloud, .75); evLeft = rand(240, 600); }
+  else if (evName === 'dusk') { T.dusk = 1; evLeft = rand(300, 540); }
+  else { T.frost = 1; T.fog = Math.min(T.fog, .55); T.cloud = Math.min(T.cloud, .5); evLeft = rand(300, 540); }
+}
+function endEvent() { T.rain = 0; T.dusk = 0; T.frost = 0; evName = ''; evTimer = rand(240, 600); }
+
+function applyHash() {
+  for (const k of hash) {
+    if (k === 'rain') { T.rain = W.rain = .9; T.fog = W.fog = .65; T.cloud = W.cloud = .85; }
+    if (k === 'dusk') { T.dusk = W.dusk = 1; }
+    if (k === 'frost') { T.frost = W.frost = 1; T.fog = W.fog = .35; T.cloud = W.cloud = .3; }
+    if (k === 'clear') { T.fog = W.fog = .3; T.cloud = W.cloud = .2; }
+    if (k === 'thick') { T.fog = W.fog = .85; }
+  }
+}
+applyHash();
+
+let glowX = .5, wClock = 0;
+function stepWorld(dt) {
+  wClock += dt; glowX = .5 + .17 * Math.sin(wClock * .006) + .05 * Math.sin(wClock * .017 + 2);
+  if (!forced) {
+    wTimer -= dt;
+    if (wTimer <= 0) { wTimer = rand(50, 140); if (T.rain < .1) T.fog = rand(.3, .82); if (evName !== 'rain') T.cloud = rand(.2, .95); }
+    if (evLeft > 0) { evLeft -= dt; if (evLeft <= 0) endEvent(); }
+    else { evTimer -= dt; if (evTimer <= 0) startEvent(); }
+  }
+  for (const k in TAU) W[k] = approach(W[k], T[k], dt, TAU[k]);
+  glTimer -= dt;
+  if (glTimer <= 0 && glT < 0) { glT = 0; glDur = rand(70, 130); glAmp = rand(.5, 1); glTimer = rand(300, 800); }
+  if (glT >= 0) { glT += dt; W.glint = Math.sin(Math.PI * clamp(glT / glDur, 0, 1)) * glAmp; if (glT > glDur) { glT = -1; W.glint = 0; } }
+}
+
+/* ---------- people ---------- */
+const L = { th: .245, sh: .245, tor: .30, ua: .165, fa: .155, neck: .04, hr: .066 };
+if (hash.includes('dbg')) window.__p = () => people;
+const POSES = {
+  stand:     { tor: 0,  head: 0,   ua: 4,   fa: 8,  ua2: -3,  fa2: 6,  th: 0,   sh: 0,    th2: 0,   sh2: 0 },
+  shift:     { tor: 2,  head: 3,   ua: 6,   fa: 12, ua2: -4,  fa2: 5,  th: 3,   sh: -3,   th2: -7,  sh2: -14 },
+  lookDown:  { tor: 8,  head: 32,  ua: 10,  fa: 20, ua2: 4,   fa2: 14, th: 0,   sh: 0,    th2: 0,   sh2: 0 },
+  lookUp:    { tor: -3, head: -34, ua: 3,   fa: 6,  ua2: -4,  fa2: 5,  th: 0,   sh: 0,    th2: 0,   sh2: 0 },
+  sitHug:    { tor: 22, head: 8,   ua: 38,  fa: 85, ua2: 30,  fa2: 80, th: 118, sh: -148, th2: 120, sh2: -150 },
+  sitDown:   { tor: 52, head: 38,  ua: 55,  fa: 95, ua2: 50,  fa2: 95, th: 120, sh: -148, th2: 122, sh2: -150 },
+  sitUp:     { tor: 12, head: -8,  ua: 38,  fa: 85, ua2: 30,  fa2: 80, th: 118, sh: -148, th2: 120, sh2: -150 },
+  sitStretch:{ tor: -8, head: 4,   ua: -28, fa: 6,  ua2: 12,  fa2: 40, th: 88,  sh: 4,    th2: 86,  sh2: 6 },
+  riseLean:  { tor: 55, head: 18,  ua: 28,  fa: 6,  ua2: 22,  fa2: 8,  th: 112, sh: -140, th2: 114, sh2: -142 },
+  crouch:    { tor: 50, head: 14,  ua: 32,  fa: 10, ua2: 28,  fa2: 12, th: 95,  sh: -120, th2: 97,  sh2: -122 },
+  standLean: { tor: 22, head: 8,   ua: 14,  fa: 12, ua2: 10,  fa2: 10, th: 20,  sh: -20,  th2: 22,  sh2: -22 },
+  sitLean:   { tor: -28,head: -8,  ua: -50, fa: 10, ua2: -45, fa2: 8,  th: 105, sh: -100, th2: 100, sh2: -95 }
+};
+const KEYS = Object.keys(POSES.stand);
+const yOf = (d) => .49 - .30 * d;
+const hOf = (d) => .05 + .025 * d;
+
+class Person {
+  constructor(o) {
+    this.x = o.x; this.d = o.d; this.mode = 'stand'; this.after = 'stand';
+    this.pose = Object.assign({}, POSES.stand); this.tgt = Object.assign({}, POSES.stand);
+    this.f = 0; this.ft = 0; this.walk = 0; this.walkT = 0; this.ph = Math.random() * 6;
+    this.timer = rand(20, 60); this.dest = null; this.alpha = o.alpha == null ? 1 : o.alpha;
+    this.alphaT = 1; this.leaving = false; this.gone = false; this.aware = Math.random() < .6;
+    this.seq = []; this.tauP = 2.2; this.pendingLeave = false; this.force = null; this.demo = false; this.other = null; this.lastDir = 1; this.life = o.life || 0; this.dirty = true;
+    if (o.walkTo) this.goto(o.walkTo.x, o.walkTo.d, 'stand');
+  }
+  setPose(n) { Object.assign(this.tgt, POSES[n]); }
+  startSeq(to) {
+    const hold = this.demo ? 6 : null;
+    this.mode = to;
+    this.seq = to === 'stand'
+      ? [{ p: 'riseLean', t: 4 }, { p: 'crouch', t: 4 }, { p: 'standLean', t: 3.5 }, { p: 'stand', t: hold || rand(25, 90) }]
+      : [{ p: 'standLean', t: 3.5 }, { p: 'crouch', t: 4 }, { p: 'riseLean', t: 4 }, { p: 'sitHug', t: hold || rand(40, 160) }];
+    this.tauP = 1.3; this.takeSeq();
+  }
+  takeSeq() { const s = this.seq.shift(); this.setPose(s.p); this.timer = s.t; if (!this.seq.length) this.tauP = 2.2; }
+  glanceDir() {
+    const o = this.other;
+    if (o && this.aware && !o.gone && Math.random() < .75) return o.x >= this.x ? 1 : -1;
+    return Math.random() < .5 ? 1 : -1;
+  }
+  goto(x, d, after) { this.dest = { x: clamp(x, .06, .94), d: clamp(d, 0, .85) }; this.mode = 'walk'; this.after = after; this.walkT = 1; this.timer = 1e9; this.setPose('stand'); }
+  leave() {
+    if (this.pendingLeave) return;
+    if (this.mode === 'sit' || this.seq.length) { this.pendingLeave = true; if (this.mode === 'sit') this.startSeq('stand'); return; }
+    this.goto(this.x + rand(-.2, .2), -.1, 'stand'); this.leaving = true;
+  }
+  next() {
+    if (this.seq.length) { this.takeSeq(); return; }
+    if (this.pendingLeave) { this.pendingLeave = false; this.leave(); return; }
+    if (this.mode === 'walk') { this.walkT = 0; this.ft = 0; this.timer = rand(25, 90); if (this.after === 'sit') this.startSeq('sit'); else { this.mode = 'stand'; this.setPose('stand'); } return; }
+    this.ft = 0;
+    if (this.mode === 'stand') {
+      const a = this.force || pickW([
+        { n: 'hold', w: 5 }, { n: 'shift', w: 2 }, { n: 'down', w: 2 }, { n: 'up', w: 1.5 }, { n: 'glance', w: 1.8 },
+        { n: 'sit', w: 1.4 }, { n: 'step', w: 1.4 }, { n: 'back', w: .6 }, { n: 'roam', w: .9 }, { n: 'away', w: this.other ? .15 : .35 }
+      ]).n;
+      this.force = null; this.setPose('stand'); this.timer = this.demo ? 6 : rand(30, 120);
+      if (a === 'shift') { this.setPose('shift'); this.timer = rand(10, 25); }
+      else if (a === 'down') { this.setPose('lookDown'); this.timer = rand(8, 20); }
+      else if (a === 'up') { this.setPose('lookUp'); this.timer = rand(8, 18); }
+      else if (a === 'glance') { this.ft = this.glanceDir(); this.timer = rand(10, 35); }
+      else if (a === 'sit') { this.startSeq('sit'); if (this.demo) this.force = 'stand'; }
+      else if (a === 'step') { this.lastDir = Math.random() < .5 ? 1 : -1; this.goto(this.x + this.lastDir * rand(.02, .06), this.d + rand(-.03, .03), 'stand'); }
+      else if (a === 'back') { this.goto(this.x - this.lastDir * rand(.02, .05), this.d, 'stand'); }
+      else if (a === 'roam') { this.goto(glowX + rand(-.3, .3), rand(.25, .55), Math.random() < .6 ? 'sit' : 'stand'); }
+      else if (a === 'away' && !this.leaving) { this.leave(); }
+    } else {
+      const a = this.force || pickW([
+        { n: 'hold', w: 4 }, { n: 'face', w: 2 }, { n: 'up', w: 2 }, { n: 'stretch', w: 1.2 }, { n: 'lean', w: 1.2 },
+        { n: 'glance', w: 1.2 }, { n: 'stand', w: 1.2 }
+      ]).n;
+      this.force = null; this.setPose('sitHug'); this.timer = this.demo ? 6 : rand(40, 200);
+      if (a === 'face') { this.setPose('sitDown'); this.timer = rand(20, 90); }
+      else if (a === 'up') { this.setPose('sitUp'); this.timer = rand(15, 60); }
+      else if (a === 'stretch') { this.setPose('sitStretch'); this.timer = rand(30, 120); }
+      else if (a === 'lean') { this.setPose('sitLean'); this.timer = rand(30, 120); }
+      else if (a === 'glance') { this.setPose('sitUp'); this.ft = this.glanceDir(); this.timer = rand(12, 40); }
+      else if (a === 'stand') { this.startSeq('stand'); if (this.demo) this.force = 'sit'; }
+    }
+  }
+  update(dt) {
+    this.timer -= dt; if (this.timer <= 0) this.next();
+    if (this.mode === 'walk' && this.dest) {
+      const dxu = (this.dest.x - this.x) * asp, dyu = yOf(this.dest.d) - yOf(this.d);
+      const dist = Math.hypot(dxu, dyu);
+      const step = .4 * hOf(this.d) * .42 * dt;
+      if (dist < 1e-4 || step >= dist) { this.x = this.dest.x; this.d = this.dest.d; if (this.leaving) { this.gone = true; } else this.next(); }
+      else {
+        const fr = step / dist; this.x += (this.dest.x - this.x) * fr; this.d += (this.dest.d - this.d) * fr;
+        this.ft = dxu / Math.hypot(dxu, dyu * 2.2);
+        if (Math.abs(dxu) > .001) this.lastDir = dxu > 0 ? 1 : -1;
+      }
+      if (this.leaving) this.alphaT = clamp(this.d / .22, 0, 1);
+    }
+    let mv = 0;
+    for (const k of KEYS) { const n = approach(this.pose[k], this.tgt[k], dt, this.tauP); mv = Math.max(mv, Math.abs(n - this.pose[k])); this.pose[k] = n; }
+    this.f = approach(this.f, this.ft, dt, 1.4);
+    this.walk = approach(this.walk, this.walkT, dt, 1.2);
+    this.ph += dt * 2 * Math.PI * .4 * this.walk;
+    this.alpha = approach(this.alpha, this.alphaT, dt, 12);
+    this.life += dt;
+  }
+  draw(ctx, CW, CH, t) {
+    if (this.alpha < .01) return;
+    const P = Object.assign({}, this.pose), w = this.walk, ph = this.ph, r = (a) => a * Math.PI / 180;
+    if (w > .01) {
+      const c1 = Math.max(0, Math.cos(ph)), c2 = Math.max(0, Math.cos(ph + Math.PI));
+      P.th += w * 26 * Math.sin(ph); P.sh += -w * 35 * c1;
+      P.th2 += -w * 26 * Math.sin(ph); P.sh2 += -w * 35 * c2;
+      P.ua += -w * 14 * Math.sin(ph); P.ua2 += w * 14 * Math.sin(ph);
+    }
+    const breath = Math.sin(t * .6 + this.x * 9) * .6;
+    P.tor += breath * .5;
+    const af = Math.abs(this.f), sgn = this.f < 0 ? -1 : 1, s = Math.max(.28, af) * sgn, lat = 1 - af;
+    const pt = (a, len) => [Math.sin(r(a)) * len, -Math.cos(r(a)) * len];
+    const leg = (th, sh) => { const k = pt(th, L.th), f2 = pt(th + sh, L.sh); return [k, [k[0] + f2[0], k[1] + f2[1]]]; };
+    const l1 = leg(P.th, P.sh), l2 = leg(P.th2, P.sh2);
+    const hy = -Math.min(l1[1][1], l2[1][1]);
+    const hip = [0, hy];
+    for (const q of [l1, l2]) { q[0][1] += hy; q[1][1] += hy; }
+    const sh = [hip[0] + Math.sin(r(P.tor)) * L.tor, hip[1] + Math.cos(r(P.tor)) * L.tor];
+    const hd = [sh[0] + Math.sin(r(P.tor + P.head)) * (L.neck + L.hr), sh[1] + Math.cos(r(P.tor + P.head)) * (L.neck + L.hr)];
+    const arm = (ua, fa) => { const e = pt(ua, L.ua), h = pt(ua + fa, L.fa); return [e, [e[0] + h[0], e[1] + h[1]]]; };
+    const a1 = arm(P.ua, P.fa), a2 = arm(P.ua2, P.fa2);
+    const u = hOf(this.d) * CH, ox = this.x * CW, oy = yOf(this.d) * CH;
+    ctx.save();
+    ctx.globalAlpha = this.alpha;
+    ctx.translate(ox, oy); ctx.scale(u, u);
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const grad = ctx.createLinearGradient(0, 0, 0, .96);
+    grad.addColorStop(0, 'rgb(115,0,0)'); grad.addColorStop(.4, 'rgb(215,0,0)'); grad.addColorStop(1, 'rgb(255,0,0)');
+    ctx.fillStyle = grad; ctx.strokeStyle = grad;
+    const X = (x, off) => x * s + (off || 0);
+    const circ = (x, y, rr) => { ctx.beginPath(); ctx.arc(x, y, rr, 0, 6.3); ctx.fill(); };
+    const limb = (p, q, w1, w2, o1, o2) => {
+      const x1 = X(p[0], o1), y1 = p[1], x2 = X(q[0], o2 == null ? o1 : o2), y2 = q[1];
+      const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1, vx = -dy / len, vy = dx / len;
+      ctx.beginPath(); ctx.moveTo(x1 + vx * w1 / 2, y1 + vy * w1 / 2); ctx.lineTo(x2 + vx * w2 / 2, y2 + vy * w2 / 2);
+      ctx.lineTo(x2 - vx * w2 / 2, y2 - vy * w2 / 2); ctx.lineTo(x1 - vx * w1 / 2, y1 - vy * w1 / 2); ctx.closePath(); ctx.fill();
+      circ(x1, y1, w1 / 2); circ(x2, y2, w2 / 2);
+    };
+    const lg = lat * .04;
+    limb(hip, l1[0], .11, .085, -lg); limb(l1[0], l1[1], .085, .05, -lg);
+    limb(hip, l2[0], .11, .085, lg); limb(l2[0], l2[1], .085, .05, lg);
+    for (const [q, o] of [[l1, -lg], [l2, lg]]) { ctx.beginPath(); ctx.ellipse(X(q[1][0], o) + .035 * s, q[1][1] + .014, .052, .022, 0, 0, 6.3); ctx.fill(); }
+    /* coat / torso: one smooth outline */
+    const ax = Math.sin(r(P.tor)), ay = Math.cos(r(P.tor)), nx = ay, ny = -ax;
+    const wS = .088 + .04 * lat, wH = .092 + .02 * lat;
+    const stand = clamp(1 - Math.abs(P.th) / 50, 0, 1) * clamp(1 - Math.abs(P.th2) / 50, 0, 1);
+    const hemY = .22 * stand, hemW = wH + .06 * stand;
+    const Q = (b, on, oa) => [X(b[0] + ax * oa) + nx * on, b[1] + ay * oa + ny * on];
+    const side = (sg) => ({
+      neck: Q(sh, sg * .034, .012), c1: Q(sh, sg * .075, .006), tip: Q(sh, sg * wS, -.03),
+      c2: Q(sh, sg * (wS + .012), -.13), waist: Q(hip, sg * wH * .88, .10),
+      c3: Q(hip, sg * (wH + .004), .035), hp: Q(hip, sg * wH, 0),
+      c4: [X(hip[0]) + sg * (wH + .02 * stand), hip[1] - hemY * .5], hem: [X(hip[0]) + sg * hemW, hip[1] - hemY]
+    });
+    const R = side(1), Lf = side(-1);
+    ctx.beginPath(); ctx.moveTo(...R.neck);
+    ctx.quadraticCurveTo(...R.c1, ...R.tip); ctx.quadraticCurveTo(...R.c2, ...R.waist); ctx.quadraticCurveTo(...R.c3, ...R.hp); ctx.quadraticCurveTo(...R.c4, ...R.hem);
+    ctx.quadraticCurveTo(X(hip[0]), hip[1] - hemY - .012, ...Lf.hem);
+    ctx.quadraticCurveTo(...Lf.c4, ...Lf.hp); ctx.quadraticCurveTo(...Lf.c3, ...Lf.waist); ctx.quadraticCurveTo(...Lf.c2, ...Lf.tip); ctx.quadraticCurveTo(...Lf.c1, ...Lf.neck);
+    ctx.closePath(); ctx.fill();
+    /* neck, arms */
+    limb(sh, [hd[0], hd[1] - .02], .064, .05, 0);
+    const sp = [sh[0], sh[1] - .035], la = lat * (wS - .012);
+    for (const [aa, o] of [[a1, -la], [a2, la]]) {
+      const e = [sp[0] + aa[0][0], sp[1] + aa[0][1]], h = [sp[0] + aa[1][0], sp[1] + aa[1][1]];
+      limb(sp, e, .068, .056, o, o * .92); limb(e, h, .056, .04, o * .92); circ(X(h[0], o * .92), h[1], .03);
+    }
+    /* head, hair */
+    const ha = r(P.tor + P.head), hcx = X(hd[0]), hcy = hd[1];
+    ctx.beginPath(); ctx.ellipse(hcx, hcy, .072, .057, Math.atan2(Math.cos(ha), Math.sin(ha) * s), 0, 6.3); ctx.fill();
+    if (lat > .05) { ctx.beginPath(); ctx.ellipse(hcx, hcy - .04, .062, .085, 0, 0, 6.3); ctx.fill(); }
+    if (af > .05) { ctx.beginPath(); ctx.ellipse(hcx - sgn * .03 * af, hcy - .022, .05, .068, 0, 0, 6.3); ctx.fill(); }
+    if (af > .5) {
+      const k = (af - .5) * 2;
+      ctx.globalAlpha = this.alpha * k;
+      circ(hcx + L.hr * .95 * sgn, hcy - .008, .017);
+      circ(hcx + L.hr * .72 * sgn, hcy + .035, .02);
+    }
+    ctx.restore();
+  }
+}
+
+/* ---------- manager: first person, second person, birds ---------- */
+const people = [];
+let p1 = new Person({ x: .5 + rand(-.12, .12), d: rand(.3, .45) });
+if (Math.random() < .5) { p1.mode = 'sit'; Object.assign(p1.pose, POSES.sitHug); Object.assign(p1.tgt, POSES.sitHug); p1.timer = rand(30, 90); }
+if (hash.includes('sit')) { p1.mode = 'sit'; Object.assign(p1.pose, POSES.sitHug); Object.assign(p1.tgt, POSES.sitHug); p1.demo = true; p1.timer = 6; p1.force = 'stand'; p1.x = .5; p1.d = .4; }
+people.push(p1);
+let p2 = null, p2Timer = rand(900, 2400), p2Life = 0, goneTimer = 0;
+const bird = { on: false, t: 0, dur: 90, x0: 0, x1: 1, y: .8, ph: 0, next: rand(480, 1400) };
+
+function arrive(o) {
+  const fromX = rand(.12, .88);
+  const p = new Person({ x: fromX, d: .02, alpha: 0, walkTo: { x: clamp(fromX + rand(-.18, .18), .1, .9), d: rand(.2, .6) } });
+  return Object.assign(p, o || {});
+}
+function stepPeople(dt, t) {
+  if (hash.includes('two') && !p2) { p2 = arrive(); p2.other = p1; p1.other = p2; p2.x = clamp(p1.x + (p1.x > .5 ? -.3 : .3), .1, .9); p2.d = .35; p2.alpha = 1; p2.dest = null; p2.mode = 'stand'; p2.walkT = 0; p2.timer = rand(20, 60); people.push(p2); }
+  for (const p of people) p.update(dt);
+  if (p1.gone) {
+    goneTimer += dt;
+    if (goneTimer > rand(60, 200)) { const i = people.indexOf(p1); const np = arrive(); np.other = p2; if (p2) p2.other = np; people[i] = np; p1 = np; goneTimer = 0; }
+  }
+  if (!forced) {
+    if (!p2 && !p1.gone) { p2Timer -= dt; if (p2Timer <= 0) { p2 = arrive(); p2.other = p1; p1.other = p2; if (Math.random() < .4) p1.aware = false; people.push(p2); p2Life = rand(360, 840); p2Timer = rand(900, 2400); } }
+    if (p2) {
+      p2Life -= dt;
+      if (p2Life <= 0 && !p2.leaving) p2.leave();
+      if (p2.gone) { people.splice(people.indexOf(p2), 1); p1.other = null; p2 = null; }
+    }
+  }
+  bird.next -= dt;
+  if (!bird.on && (bird.next <= 0 || (hash.includes('bird') && bird.next < 0))) {
+    bird.on = true; bird.t = 0; bird.dur = rand(70, 120); const dir = Math.random() < .5; bird.x0 = dir ? -.04 : 1.04; bird.x1 = dir ? 1.04 : -.04;
+    bird.y = rand(.7, .88); bird.next = rand(600, 1500);
+  }
+  if (bird.on) { bird.t += dt; bird.ph += dt * 9; if (bird.t > bird.dur) bird.on = false; }
+}
+function drawPeople(ctx, CW, CH, t) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over'; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, CW, CH);
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of people) if (!p.gone) p.draw(ctx, CW, CH, t);
+  if (bird.on) {
+    const k = bird.t / bird.dur, bx = (bird.x0 + (bird.x1 - bird.x0) * k) * CW, by = (bird.y + Math.sin(k * 9) * .012) * CH;
+    const sz = .0045 * CH, fl = Math.sin(bird.ph) * .8;
+    ctx.setTransform(1, 0, 0, 1, bx, by); ctx.strokeStyle = '#0f0'; ctx.lineWidth = Math.max(1, sz * .35); ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(-sz, -sz * fl * .6); ctx.lineTo(0, 0); ctx.lineTo(sz, -sz * fl * .6); ctx.stroke();
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+/* ---------- window: condensation (wipeable) and droplets (not wipeable) ---------- */
+let gw = 256, gh = 144, cond, cmul, cu8;
+function initCond() {
+  gh = Math.max(64, Math.round(gw / asp));
+  cond = new Float32Array(gw * gh); cmul = new Float32Array(gw * gh); cu8 = new Uint8Array(gw * gh);
+  const sd = Math.random() * 50;
+  const n = (x, y) => { const i = Math.floor(x), j = Math.floor(y), fx = x - i, fy = y - j, s = (a, b) => { const v = Math.sin((a + sd) * 127.1 + (b + sd) * 311.7) * 43758.5453; return v - Math.floor(v); }; const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy); return (s(i, j) * (1 - u) + s(i + 1, j) * u) * (1 - v) + (s(i, j + 1) * (1 - u) + s(i + 1, j + 1) * u) * v; };
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) {
+    const nx = x / gw, ny = y / gh, e = Math.hypot((nx - .5) * 1.2, (ny - .5)) * 1.4;
+    cmul[y * gw + x] = clamp(.62 + .5 * n(nx * 4.5, ny * 4.5 / asp * 1.8) + .28 * e, .3, 1.2);
+  }
+  if (hash.includes('wet')) for (let i = 0; i < cond.length; i++) cond[i] = Math.min(.9, cmul[i] * .8);
+  condDirty = true;
+}
+let condDirty = true;
+function stepCond(dt) {
+  const rr = clamp((W.rain - .15) * 1.5, 0, 1), gG = 1 - Math.exp(-dt / 70), gE = 1 - Math.exp(-dt / 200);
+  let any = false;
+  for (let i = 0; i < cond.length; i++) {
+    const tg = rr > 0 ? Math.min(.96, rr * cmul[i] * 1.1) : 0, c = cond[i];
+    if (c === tg) continue;
+    const n = c + (tg - c) * (tg > c ? gG : gE);
+    cond[i] = Math.abs(n) < .002 ? 0 : n; any = true;
+  }
+  if (any) condDirty = true;
+}
+function wipeAt(cx, cy, rad, k) {
+  const x0 = Math.max(0, Math.floor(cx - rad)), x1 = Math.min(gw - 1, Math.ceil(cx + rad));
+  const y0 = Math.max(0, Math.floor(cy - rad)), y1 = Math.min(gh - 1, Math.ceil(cy + rad));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const d = Math.hypot(x - cx, y - cy) / rad; if (d >= 1) continue;
+    const s = clamp((d - .55) / .45, 0, 1), w = 1 - s * s * (3 - 2 * s);
+    cond[y * gw + x] *= 1 - w * k;
+  }
+  condDirty = true;
+}
+function wipe(u0, v0, u1, v1) {
+  const rad = .045 * gh, ax = u0 * gw, ay = v0 * gh, bx = u1 * gw, by = v1 * gh;
+  const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / (rad * .4)));
+  for (let i = 0; i <= n; i++) wipeAt(ax + (bx - ax) * i / n, ay + (by - ay) * i / n, rad, .98);
+}
+
+const drops = []; let dgw = 320, dgh = 180, dbuf; let dropsDirty = true, dropAcc = 0;
+function initDrops() { dgh = Math.max(64, Math.round(dgw / asp)); dbuf = new Uint8Array(dgw * dgh * 4); drops.length = 0; dropsDirty = true; }
+function stepDrops(dt) {
+  const wet = W.rain > .15;
+  const maxN = Math.round(clamp(W.rain, 0, 1) * 60);
+  if (wet && drops.length < maxN) { dropAcc += dt * (.4 + W.rain * 1.2); while (dropAcc >= 1) { dropAcc -= 1; drops.push({ x: Math.random(), y: Math.random() * .96 + .02, r: 0, rt: rand(2.2, 5.8), slide: 0, vy: 0 }); } }
+  for (let i = drops.length - 1; i >= 0; i--) {
+    const d = drops[i];
+    if (wet) d.r = approach(d.r, d.rt, dt, 6);
+    else { d.rt *= Math.exp(-dt / 420); d.r = approach(d.r, d.rt, dt, 20); if (d.r < 1.3) { drops.splice(i, 1); dropsDirty = true; continue; } }
+    if (d.slide > 0) {
+      d.slide -= dt; const dy = d.vy * dt; d.y -= dy;
+      wipeAt(d.x * gw, d.y * gh, 2.2, .5); d.rt = Math.max(1.8, d.rt - dt * .02);
+      if (d.y < -.02) { drops.splice(i, 1); }
+      dropsDirty = true;
+    } else if (d.r > 3.8 && W.rain > .2 && Math.random() < dt * .012) { d.slide = rand(4, 15); d.vy = rand(.003, .012); }
+  }
+  if (drops.length || dropsDirty) {
+    dropsDirty = false;
+    dbuf.fill(0); for (let i = 0; i < dbuf.length; i += 4) { dbuf[i] = 128; dbuf[i + 1] = 128; }
+    for (const d of drops) {
+      const r = d.r, cx = d.x * dgw, cy = d.y * dgh, st = Math.min(1, r / 6);
+      for (let y = Math.max(0, Math.floor(cy - r)); y <= Math.min(dgh - 1, Math.ceil(cy + r)); y++) for (let x = Math.max(0, Math.floor(cx - r)); x <= Math.min(dgw - 1, Math.ceil(cx + r)); x++) {
+        const dx = (x - cx) / r, dy = (y - cy) / r, q = dx * dx + dy * dy; if (q > 1) continue;
+        const a = clamp((1 - Math.sqrt(q)) / .22, 0, 1), o = (y * dgw + x) * 4;
+        dbuf[o] = 128 + 127 * (-dx * st); dbuf[o + 1] = 128 + 127 * (-dy * st); dbuf[o + 3] = 255 * a;
+      }
+    }
+    dropUp = true;
+  }
+}
+let dropUp = true;
+
+/* ---------- WebGL ---------- */
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl', { antialias: false, alpha: false, powerPreference: 'low-power' });
+let GLOK = !!gl;
+function mkProg(fs) {
+  const sh = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o); if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(o)); } return o; };
+  const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, VS)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.bindAttribLocation(p, 0, 'a'); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+  const loc = {}; return { p, u: (n) => (n in loc ? loc[n] : (loc[n] = gl.getUniformLocation(p, n))) };
+}
+const mkTex = (filter) => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); return t; };
+let P1, P2, texFig, texScene, texCond, texDrops, fbo;
+const fig = document.createElement('canvas'), fctx = fig.getContext('2d');
+if (hash.includes('dbg')) window.__fig = fig;
+let CW = 960, CH = 540, SW = 2, SH = 2;
+if (GLOK) {
+  P1 = mkProg(FS_SCENE); P2 = mkProg(FS_FINAL);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  texFig = mkTex(gl.LINEAR); texScene = mkTex(gl.LINEAR); texCond = mkTex(gl.LINEAR); texDrops = mkTex(gl.LINEAR);
+  fbo = gl.createFramebuffer();
+}
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(2, Math.floor(innerWidth * dpr)), h = Math.max(2, Math.floor(innerHeight * dpr));
+  const cap = Math.min(1, 2000 / Math.max(w, h));
+  cv.width = Math.floor(w * cap); cv.height = Math.floor(h * cap);
+  const na = cv.width / cv.height;
+  const changed = Math.abs(na - asp) > .05;
+  asp = na;
+  CW = 1280; CH = Math.max(160, Math.round(CW / asp)); fig.width = CW; fig.height = CH;
+  SW = Math.max(2, Math.floor(cv.width * .62)); SH = Math.max(2, Math.floor(cv.height * .62));
+  if (GLOK) {
+    gl.bindTexture(gl.TEXTURE_2D, texScene); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SW, SH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texScene, 0); gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+  if (!cond || changed) { initCond(); initDrops(); }
+  figDirtyAt = 0;
+}
+let figDirtyAt = 0;
+
+/* ---------- camera (zoom only) ---------- */
+let zT = 1, sxT = 0, syT = 0, zC = 1, sxC = 0, syC = 0;
+function zoomAt(k, ax, ay) {
+  const wx = sxT + ax / zT, wy = syT + ay / zT;
+  zT = clamp(zT * k, 1, 4);
+  sxT = clamp(wx - ax / zT, 0, 1 - 1 / zT); syT = clamp(wy - ay / zT, 0, 1 - 1 / zT);
+}
+
+/* ---------- input ---------- */
+const ptrs = new Map(); let lastPinch = 0;
+const toUV = (e) => [e.clientX / innerWidth, 1 - e.clientY / innerHeight];
+const pdist = () => { const a = [...ptrs.values()]; return Math.hypot(a[0].x - a[1].x, a[0].y - a[1].y) || 1; };
+cv.addEventListener('pointerdown', (e) => {
+  try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY, e }); startAudio();
+  if (ptrs.size === 2) lastPinch = pdist();
+});
+cv.addEventListener('pointermove', (e) => {
+  const p = ptrs.get(e.pointerId); if (!p) return;
+  if (ptrs.size === 1) { const [u0, v0] = [p.x / innerWidth, 1 - p.y / innerHeight], [u1, v1] = toUV(e); wipe(u0, v0, u1, v1); }
+  p.x = e.clientX; p.y = e.clientY;
+  if (ptrs.size === 2) {
+    const a = [...ptrs.values()], d = pdist(), mx = (a[0].x + a[1].x) / 2 / innerWidth, my = 1 - (a[0].y + a[1].y) / 2 / innerHeight;
+    zoomAt(d / lastPinch, mx, my); lastPinch = d;
+  }
+});
+const up = (e) => { ptrs.delete(e.pointerId); if (ptrs.size === 1) { const p = [...ptrs.values()][0]; p.x = p.x; } };
+cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
+cv.addEventListener('wheel', (e) => { e.preventDefault(); const [u, v] = toUV(e); zoomAt(Math.exp(-e.deltaY * (e.ctrlKey ? .01 : .0015)), u, v); startAudio(); }, { passive: false });
+addEventListener('keydown', startAudio);
+addEventListener('resize', resize);
+
+/* ---------- audio: wind, rain, distant waves (small, continuous, weather-driven) ---------- */
+let A = null;
+function startAudio() {
+  if (A) { if (A.ctx.state !== 'running') A.ctx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+  try {
+    const ctx = new AC(), sr = ctx.sampleRate;
+    const mk = (brown) => { const b = ctx.createBuffer(1, sr * 6, sr), d = b.getChannelData(0); let l = 0; for (let i = 0; i < d.length; i++) { const w = Math.random() * 2 - 1; if (brown) { l = (l + .02 * w) / 1.02; d[i] = l * 3.5; } else d[i] = w; } const s = ctx.createBufferSource(); s.buffer = b; s.loop = true; s.start(); return s; };
+    const master = ctx.createGain(); master.gain.value = 0; master.connect(ctx.destination); master.gain.setTargetAtTime(.9, ctx.currentTime, 4);
+    const chain = (src, nodes, g0) => { let n = src; for (const x of nodes) { n.connect(x); n = x; } const g = ctx.createGain(); g.gain.value = g0; n.connect(g); g.connect(master); return g; };
+    const bq = (type, f, q) => { const b = ctx.createBiquadFilter(); b.type = type; b.frequency.value = f; if (q) b.Q.value = q; return b; };
+    const wb = bq('bandpass', 380, .5);
+    A = { ctx, wind: chain(mk(true), [wb], 0), wb, rain: chain(mk(false), [bq('highpass', 900), bq('lowpass', 6500)], 0), wave: chain(mk(true), [bq('lowpass', 420)], 0), hush: chain(mk(false), [bq('bandpass', 1800, .4)], 0), n: 0, sw: rand(0, 6) };
+    ctx.resume();
+  } catch (_) { A = null; }
+}
+function stepAudio(dt, t) {
+  if (!A || A.ctx.state !== 'running') return;
+  A.n += dt; if (A.n < .1) return; const d = A.n; A.n = 0;
+  const now = A.ctx.currentTime;
+  const gust = .5 + .5 * Math.sin(t * .13) * Math.sin(t * .071 + 1.3) + .15 * Math.sin(t * .31);
+  A.wind.gain.setTargetAtTime(.020 + .045 * clamp(gust, 0, 1) * (.6 + W.cloud * .5), now, .6);
+  A.wb.frequency.setTargetAtTime(260 + 320 * clamp(gust, 0, 1), now, .8);
+  A.rain.gain.setTargetAtTime(.075 * Math.pow(clamp(W.rain, 0, 1), 1.2), now, 1.5);
+  A.sw += d / (9 + 3 * Math.sin(t * .05));
+  const sw = .5 + .5 * Math.sin(A.sw * 6.283);
+  A.wave.gain.setTargetAtTime(.022 + .05 * sw * sw, now, .8);
+  A.hush.gain.setTargetAtTime(.012 * Math.pow(sw, 3) * (1 - W.rain * .5), now, .6);
+}
+document.addEventListener('visibilitychange', () => { if (!A) return; if (document.hidden) A.ctx.suspend(); else A.ctx.resume(); });
+
+/* ---------- main loop ---------- */
+let last = 0, tClock = 0, accC = 0, upC = 1, upD = 1, upF = 1;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(.1, (ts - last) / 1000 || .016); last = ts; tClock += dt;
+  stepWorld(dt); stepPeople(dt, tClock);
+  accC += dt; if (accC > .12) { stepCond(accC); stepDrops(accC); accC = 0; }
+  stepAudio(dt, tClock);
+  zC = approach(zC, zT, dt, .12); sxC = approach(sxC, sxT, dt, .12); syC = approach(syC, syT, dt, .12);
+  if (!GLOK) return;
+  const sx = clamp(sxC, 0, 1 - 1 / zC), sy = clamp(syC, 0, 1 - 1 / zC);
+  upF += dt; if (upF > .05) { upF = 0; drawPeople(fctx, CW, CH, tClock); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texFig); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, fig); }
+  upC += dt; if (condDirty && upC > .07) { upC = 0; condDirty = false; for (let i = 0; i < cond.length; i++) cu8[i] = Math.min(255, cond[i] * 255); gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texCond); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, gw, gh, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, cu8); }
+  upD += dt; if (dropUp && upD > .2) { upD = 0; dropUp = false; gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texDrops); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, dgw, dgh, 0, gl.RGBA, gl.UNSIGNED_BYTE, dbuf); }
+  /* pass 1 */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.viewport(0, 0, SW, SH);
+  gl.useProgram(P1.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texFig);
+  const u1 = (n, ...v) => gl['uniform' + v.length + 'f'](P1.u(n), ...v);
+  gl.uniform1i(P1.u('uFig'), 0); u1('uRes', SW, SH); u1('uT', tClock); u1('uZoom', zC); u1('uWin', sx, sy);
+  u1('uDusk', W.dusk); u1('uFog', W.fog); u1('uCloud', W.cloud); u1('uRain', W.rain); u1('uFrost', W.frost); u1('uGlint', W.glint); u1('uFigPx', 1 / CW, 1 / CH); u1('uGlow', glowX, .40);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  /* pass 2 */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, cv.width, cv.height);
+  gl.useProgram(P2.p);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texScene);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texCond);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texDrops);
+  gl.uniform1i(P2.u('uScene'), 1); gl.uniform1i(P2.u('uCond'), 2); gl.uniform1i(P2.u('uDrops'), 3);
+  gl.uniform2f(P2.u('uRes'), cv.width, cv.height); gl.uniform1f(P2.u('uT'), tClock); gl.uniform1f(P2.u('uAmb'), clamp(.15 + .75 * W.dusk, 0, 1));
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+resize();
+requestAnimationFrame(frame);
+})();
+</script>
+</html>
